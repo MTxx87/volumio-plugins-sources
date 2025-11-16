@@ -1,12 +1,22 @@
+/// <reference path="./types.js" />
 "use strict";
-
 var libQ = require("kew");
-var fs = require("fs-extra");
-var config = new (require("v-conf"))();
-const { listCD } = require("./lib/utils");
-const { fetchCdMetadata } = require("./lib/metadata");
+const { listCD, pRetry, detectCdDevice } = require("./lib/utils");
+const {
+  fetchCdMetadata,
+  decorateItems,
+  getAlbumartUrl,
+} = require("./lib/metadata");
+const { createTrayWatcher } = require("./lib/tray-watcher");
+const { promisify } = require("util");
+const { exec } = require("child_process");
+const execAsync = promisify(exec);
 
 module.exports = cdplayer;
+
+const SERVICE_FILE = "cdplayer_stream.service";
+const CD_HTTP_BASE_URL = "http://127.0.0.1:8088/wav/track/";
+
 function cdplayer(context) {
   var self = this;
 
@@ -16,6 +26,8 @@ function cdplayer(context) {
   this.configManager = this.context.configManager;
   /** @type {CdTrack[]|null} */
   this._items = null;
+  /** @type {TrayWatcher|null} */
+  this._trayWatcher = null;
 }
 
 cdplayer.prototype.log = function (msg) {
@@ -40,11 +52,26 @@ cdplayer.prototype.onVolumioStart = function () {
 };
 
 cdplayer.prototype.onStart = function () {
-  // TODO: the background service should be enabled on plugin enablement, not in install.sh
   var self = this;
   var defer = libQ.defer();
   self.addToBrowseSources();
-  defer.resolve();
+
+  execAsync(`sudo /bin/systemctl enable --now ${SERVICE_FILE}`)
+    .then(() => self.log("Daemon service started"))
+    .catch((err) => self.error("Failed to start Daemon: " + err.message))
+    .finally(() => defer.resolve());
+
+  try {
+    if (!self._trayWatcher || !self._trayWatcher.isRunning()) {
+      const device = detectCdDevice();
+      const trayConfig = getTrayWatcherConfiguration(self, device);
+      self._trayWatcher = createTrayWatcher(trayConfig);
+      self._trayWatcher.start();
+    }
+  } catch (e) {
+    self.error("Tray watcher failed to start: " + e.message);
+  }
+
   return defer.promise;
 };
 
@@ -52,17 +79,43 @@ cdplayer.prototype.onStop = function () {
   var self = this;
   var defer = libQ.defer();
 
+  self._items = null;
   self.removeToBrowseSources();
 
-  // Once the Plugin has successfull stopped resolve the promise
-  defer.resolve();
+  execAsync(`sudo /bin/systemctl disable --now ${SERVICE_FILE}`)
+    .then(() => self.log("Daemon service stopped"))
+    .catch((err) => self.error("Failed to stop Daemon: " + err.message))
+    .finally(() => defer.resolve());
 
-  return libQ.resolve();
+  if (this._trayWatcher) {
+    this._trayWatcher.stop();
+  }
+  return defer.promise;
 };
 
 cdplayer.prototype.onRestart = function () {
   var self = this;
-  // Optional, use if you need it
+  var defer = libQ.defer();
+
+  execAsync(`sudo /bin/systemctl restart ${SERVICE_FILE}`)
+    .then(() => self.log("Daemon service restarted"))
+    .catch((err) => self.error("Failed to restart Daemon: " + err.message))
+    .finally(() => defer.resolve());
+
+  try {
+    if (self._trayWatcher) {
+      self._trayWatcher.stop();
+    }
+    const device = detectCdDevice();
+    const trayConfig = getTrayWatcherConfiguration(self, device);
+    self._trayWatcher = createTrayWatcher(trayConfig);
+    self._trayWatcher.start();
+    self.log("Tray watcher restarted");
+  } catch (e) {
+    self.error("Tray watcher failed to start: " + e.message);
+  }
+
+  return defer.promise;
 };
 
 // Configuration Methods -----------------------------------------------------------------------------
@@ -131,12 +184,29 @@ cdplayer.prototype.removeToBrowseSources = function () {
 };
 
 cdplayer.prototype.handleBrowseUri = function (curUri) {
+  const self = this;
+
   if (curUri !== "cdplayer") {
-    this._items = null;
     return libQ.resolve(null);
   }
 
-  const self = this;
+  if (self._items) {
+    self.log("Using cached CD track list");
+    return libQ.resolve({
+      navigation: {
+        prev: { uri: "cdplayer" },
+        lists: [
+          {
+            title: self._items[0]?.album || "CD Tracks",
+            icon: "fa fa-music",
+            availableListViews: ["list"],
+            items: self._items,
+          },
+        ],
+      },
+    });
+  }
+
   const p = (async () => {
     try {
       const items = await listCD();
@@ -156,17 +226,13 @@ cdplayer.prototype.handleBrowseUri = function (curUri) {
       let decoratedItems = items;
       if (meta) {
         // eg. https://coverartarchive.org/release/2174675c-2159-4405-a3af-3a4860106b58/front
-        const albumart = `https://coverartarchive.org/release/${meta.releaseId}/front-500`;
-        decoratedItems = items.map((item, index) => ({
-          ...item,
-          album: meta.album,
-          artist: meta.artist,
-          title: meta.tracks[index]?.title || item.title,
-          albumart,
-        }));
-
+        const albumart = getAlbumartUrl(meta.releaseId);
+        decoratedItems = decorateItems(items, meta, albumart);
         self.removeToBrowseSources();
         self.addToBrowseSources(albumart);
+      } else {
+        self.log("No CD metadata found, retrying in background");
+        void retryFetchMetadata(items, self);
       }
 
       self._items = decoratedItems;
@@ -186,7 +252,6 @@ cdplayer.prototype.handleBrowseUri = function (curUri) {
       };
     } catch (err) {
       self.error(`Error while listing CD tracks`);
-      console.log(err);
       self.commandRouter.pushToastMessage(
         "error",
         "CD Player",
@@ -210,7 +275,7 @@ cdplayer.prototype.explodeUri = function (uri) {
     const track = {
       ...self._items[n - 1],
       service: "mpd",
-      uri: `http://127.0.0.1:8088/wav/track/${n}`,
+      uri: `${CD_HTTP_BASE_URL}${n}`,
     };
 
     defer.resolve([track]);
@@ -220,6 +285,83 @@ cdplayer.prototype.explodeUri = function (uri) {
   defer.resolve([]);
   return defer.promise;
 };
+
+cdplayer.prototype.search = function (query) {
+  const self = this;
+  const defer = libQ.defer();
+
+  if (!self._items) {
+    defer.resolve(null);
+    return defer.promise;
+  }
+
+  if (!query || !query.value) {
+    defer.resolve(null);
+    return defer.promise;
+  }
+
+  try {
+    const resultItems = getResultItems(self._items, query.value);
+    const list = [
+      {
+        type: "title",
+        title: "Search results",
+        availableListViews: ["list"],
+        items: resultItems,
+      },
+    ];
+
+    self.log(`Search results: ${JSON.stringify(list)}`);
+    defer.resolve(list);
+  } catch (err) {
+    self.error(`[CDPlayer] Search error: ${err.message}`);
+    defer.reject(err);
+  }
+
+  return defer.promise;
+};
+
+/**
+ * Filters CD tracks based on a query string.
+ * Matches are case-insensitive and partial (substring-based).
+ *
+ * @param {CdTrack[]} items - Array of track objects.
+ * @param {string} query - The search query.
+ * @returns {CdTrack[]} Filtered array of matching tracks.
+ */
+function getResultItems(items, query) {
+  if (!items || !Array.isArray(items) || !query) return [];
+
+  const q = query.trim().toLowerCase();
+
+  return items.filter((item) => {
+    const titleMatch = item.title?.toLowerCase().includes(q);
+    const artistMatch = item.artist?.toLowerCase().includes(q);
+    const albumMatch = item.album?.toLowerCase().includes(q);
+    return titleMatch || artistMatch || albumMatch;
+  });
+}
+
+function retryFetchMetadata(items, self) {
+  void pRetry(
+    async () => {
+      const meta = await fetchCdMetadata();
+      if (!meta) {
+        throw new Error();
+      }
+      const albumart = getAlbumartUrl(meta.releaseId);
+      const decoratedItems = decorateItems(items, meta, albumart);
+      self.removeToBrowseSources();
+      self.addToBrowseSources(albumart);
+      self._items = decoratedItems;
+    },
+    {
+      delay: 700,
+      maxAttempts: 3,
+      logger: self,
+    }
+  );
+}
 
 function toKew(promise) {
   const d = libQ.defer();
@@ -238,4 +380,51 @@ function toKew(promise) {
       }
     });
   return d.promise;
+}
+
+/**
+ * Build configuration object for tray watcher.
+ * Extracted to keep onStart concise.
+ * @param {any} self Plugin instance (for logging & callbacks)
+ * @param {string|null} device Detected device path
+ * @returns {TrayWatcherOptions}
+ */
+function getTrayWatcherConfiguration(self, device) {
+  return {
+    logger: self,
+    device,
+    onEvent: function () {},
+    onEject: function () {
+      self.log("Eject detected ... ");
+      // Drop CD track cache so next browse forces a re-scan
+      self._items = null;
+
+      try {
+        const state = self.commandRouter.volumioGetState();
+        self.log(`Current state: ${JSON.stringify(state)}`);
+
+        const isCdStream =
+          state &&
+          state.service === "mpd" &&
+          typeof state.uri === "string" &&
+          state.uri.indexOf(CD_HTTP_BASE_URL) === 0;
+
+        if (isCdStream) {
+          self.log("Stopping CD playback due to eject event");
+          self.commandRouter.volumioStop();
+          self.commandRouter.volumioClearQueue();
+        }
+      } catch (e) {
+        self.log("Error stopping playback on eject: " + e.message);
+      }
+
+      // Refresh browse source so albumart resets to the default icon
+      try {
+        self.removeToBrowseSources();
+        self.addToBrowseSources();
+      } catch (e) {
+        self.log("Error refreshing browse sources after eject: " + e.message);
+      }
+    },
+  };
 }

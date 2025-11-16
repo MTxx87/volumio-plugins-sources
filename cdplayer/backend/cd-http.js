@@ -51,12 +51,16 @@ const { spawnSync } = require("child_process"); // add at top if not present
 function sectorsForTrack(n) {
   const env = { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin:/usr/local/bin" };
   const args = ["-Q", "-d", CD_DEVICE];
-
-  // capture BOTH stdout and stderr regardless of exit code
-  const proc = spawnSync("/usr/bin/cdparanoia", args, {
-    env,
-    encoding: "utf8",
-  });
+  let proc;
+  try {
+    proc = spawnSync("/usr/bin/cdparanoia", args, {
+      env,
+      encoding: "utf8",
+    });
+  } catch (e) {
+    console.error("[cd-http] spawnSync error while running cdparanoia -Q:", e);
+    return 0;
+  }
 
   // cdparanoia often writes the table to stderr even on success
   const out = (proc.stdout || "") + (proc.stderr || "");
@@ -275,7 +279,5 @@ const server = http.createServer((req, res) => {
 
 // Start server
 server.listen(PORT, HOST, () => {
-  console.log(
-    `CD HTTP @ http://${HOST}:${PORT}/wav/track/:n  (fixed-size WAV; no Range yet)`
-  );
+  console.log(`CD HTTP @ http://${HOST}:${PORT}/wav/track/:n`);
 });

@@ -4,18 +4,6 @@ const { execFile } = require("child_process");
 const fs = require("fs");
 
 /**
- * @typedef {Object} CdTrack
- * @property {string}   album
- * @property {string}   artist
- * @property {string}   title
- * @property {string}   trackType
- * @property {string}   type
- * @property {string}   service
- * @property {string}   uri
- * @property {number}   duration
- */
-
-/**
  * Detects the CD device path available on the system.
  *
  * @function detectCdDevice
@@ -23,7 +11,11 @@ const fs = require("fs");
  */
 function detectCdDevice() {
   const envDev = process.env.CD_DEVICE;
-  if (envDev && fs.existsSync(envDev)) return envDev;
+  try {
+    if (envDev && fs.existsSync(envDev)) return envDev;
+  } catch (e) {
+    // ignore and fall through to candidates
+  }
   const candidates = [
     "/dev/sr0",
     "/dev/sr1",
@@ -31,7 +23,14 @@ function detectCdDevice() {
     "/dev/cdrw",
     "/dev/dvd",
   ];
-  return candidates.find((p) => fs.existsSync(p)) || "/dev/sr0";
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch (e) {
+      // ignore and continue
+    }
+  }
+  return "/dev/sr0";
 }
 
 /**
@@ -130,7 +129,133 @@ async function listCD() {
   }
 }
 
+async function pTimeout(fn, opt) {
+  if (!opt.timeout) {
+    // short-circuit to direct execution if 0 timeout is passed
+    return await fn();
+  }
+  const { timeout, name = fn.name || "pTimeout function", onTimeout } = opt;
+  const fakeError = opt.fakeError || new Error("TimeoutError");
+  // biome-ignore lint/suspicious/noAsyncPromiseExecutor: ok
+  return await new Promise(async (resolve, reject) => {
+    // Prepare the timeout timer
+    const timer = setTimeout(() => {
+      const err = new Error(
+        `"${name}" timed out after ${timeout} ms`,
+        opt.errorData
+      );
+      // keep original stack
+      err.stack = fakeError.stack.replace(
+        "Error: TimeoutError",
+        "TimeoutError: " + err.message
+      );
+      if (onTimeout) {
+        try {
+          resolve(onTimeout(err));
+        } catch (err) {
+          // keep original stack
+          err.stack = fakeError.stack.replace(
+            "Error: TimeoutError",
+            err.name + ": " + err.message
+          );
+          // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+          reject({
+            err,
+            errorData: opt.errorData,
+          });
+        }
+        return;
+      }
+      reject(err);
+    }, timeout);
+    // Execute the Function
+    try {
+      resolve(await fn());
+    } catch (err) {
+      reject(err);
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+}
+
+async function pDelay(ms = 0, value) {
+  return await new Promise((resolve, reject) =>
+    setTimeout(value instanceof Error ? reject : resolve, ms, value)
+  );
+}
+
+async function pRetry(fn, opt = {}) {
+  const {
+    maxAttempts = 4,
+    delay: initialDelay = 1000,
+    delayMultiplier = 2,
+    predicate,
+    logger = console,
+    name,
+    timeout,
+  } = opt;
+  const fakeError = timeout ? new Error("TimeoutError") : undefined;
+  let {
+    logFirstAttempt = false,
+    logRetries = true,
+    logFailures = true,
+    logSuccess = false,
+  } = opt;
+  if (opt.logAll) {
+    logSuccess = logFirstAttempt = logRetries = logFailures = true;
+  }
+  if (opt.logNone) {
+    logSuccess = logFirstAttempt = logRetries = logFailures = false;
+  }
+  const fname = name || fn.name || "pRetry function";
+  let delay = initialDelay;
+  let attempt = 0;
+  while (true) {
+    const started = Date.now();
+    try {
+      attempt++;
+      if ((attempt === 1 && logFirstAttempt) || (attempt > 1 && logRetries)) {
+        logger.log(`${fname} attempt #${attempt}...`);
+      }
+      let result;
+      if (timeout) {
+        result = await pTimeout(async () => await fn(attempt), {
+          timeout,
+          name: fname,
+          errorData: opt.errorData,
+          fakeError,
+        });
+      } else {
+        result = await fn(attempt);
+      }
+      if (logSuccess) {
+        logger.log(`${fname} attempt #${attempt} succeeded`);
+      }
+      return result;
+    } catch (err) {
+      if (logFailures) {
+        // Logger at warn (not error) level, because it's not a fatal error, but a retriable one
+        // Fatal one is not logged either, because it's been thrown instead
+        logger.log(`${fname} attempt #${attempt} error`, err);
+      }
+      if (
+        attempt >= maxAttempts ||
+        (predicate && !predicate(err, attempt, maxAttempts))
+      ) {
+        // Give up
+        throw _errorDataAppend(err, opt.errorData);
+      }
+      // Retry after delay
+      delay *= delayMultiplier;
+      await pDelay(delay);
+      // back to while(true) loop
+    }
+  }
+}
+
 module.exports = {
+  pRetry,
   listCD,
   detectCdDevice,
 };

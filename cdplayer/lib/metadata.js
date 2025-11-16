@@ -1,23 +1,10 @@
+/// <reference path="../types.js" />
 const { detectCdDevice } = require("./utils");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const _nodeFetch = require("node-fetch");
 global.fetch = _nodeFetch.default || _nodeFetch;
-console.log("[metadata.js] typeof fetch:", typeof fetch);
 const execFileAsync = promisify(execFile);
-
-/**
- * @typedef {Object} TrackMetadata
- * @property {number|null} no
- * @property {string}       title
- * @property {number|null}  durationSec
- *
- * @typedef {Object} CdMetadata
- * @property {string}   album
- * @property {string}   artist
- * @property {string}   releaseId
- * @property {TrackMetadata[]} tracks
- */
 
 /**
  * Retrieves the MusicBrainz Disc ID of the currently inserted audio CD.
@@ -247,7 +234,36 @@ async function fetchCdMetadata() {
     return null;
   }
 }
+/**
+ * Decorates a list of CD track items with metadata such as album, artist, and album art.
+ *
+ * @param {CdTrack[]} items - The original list of CD track items.
+ * @param {CdMetadata} meta - The metadata to apply to each track.
+ * @param {string} albumart - The URL of the album art image.
+ * @returns {CdTrack[]} The decorated list of CD track items.
+ */
+function decorateItems(items, meta, albumart) {
+  return items.map((item, index) => ({
+    ...item,
+    album: meta.album,
+    artist: meta.artist,
+    title: meta.tracks[index]?.title || item.title,
+    albumart,
+  }));
+}
+
+/**
+ * Constructs the URL for the album art image from MusicBrainz Cover Art Archive.
+ *
+ * @param {string} releaseId - The MusicBrainz release ID.
+ * @returns {string} The URL of the album art image.
+ */
+function getAlbumartUrl(releaseId) {
+  return `https://coverartarchive.org/release/${releaseId}/front-500`;
+}
 
 module.exports = {
   fetchCdMetadata,
+  decorateItems,
+  getAlbumartUrl,
 };
